@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch import Tensor, nn, einsum
 from torch.nn import Module, ModuleList
 
@@ -37,6 +38,10 @@ def set_eos_id(t: Tensor, eos_id: int, pad_id: int):
     t = F.pad(t, (0, 1), value = pad_id)
     t[batch_range, eos_indices] = eos_id
     return t
+
+def batch_unique_consecutive(t, pad_value = 0.):
+    unique_arr = [torch.unique_consecutive(el) for el in t.unbind(dim = 0)]
+    return pad_sequence(unique_arr, batch_first = True, padding_value = pad_value)
 
 # sampling helpers
 
@@ -328,6 +333,7 @@ class TextToSemantic(Module):
         text_pad_id = 0,
         autoset_semantic_eos_id = True,
         autoset_text_eos_id = True,
+        freeze_encoder = False
     ):
         super().__init__()
         self.dim = dim
@@ -422,12 +428,18 @@ class TextToSemantic(Module):
             causal = True,
             cross_attend = True
         )
+        
+        self.freeze_encoder = freeze_encoder
 
-    def load(self, path, strict = True):
+    def load(self, path):
+        # Return pkg so that if this function gets called from within a Trainer function call,
+        # the trainer can also access the package loaded from the checkpoint.
+        device = self.device
         path = Path(path)
         assert path.exists()
-        pkg = torch.load(str(path), map_location = 'cpu')
-        self.load_state_dict(pkg, strict = strict)
+        pkg = torch.load(str(path), map_location = device)
+        self.load_state_dict(pkg['model'])
+        return pkg
 
     @property
     def device(self):
@@ -538,7 +550,7 @@ class TextToSemantic(Module):
             assert exists(self.tokenizer_encode)
             source = self.tokenizer_encode(source)
             source = source.to(self.device)
-
+        
         if is_bearable(target, List[str]):
             assert exists(self.tokenizer_encode)
             target = self.tokenizer_encode(target)
@@ -584,7 +596,11 @@ class TextToSemantic(Module):
 
         # source attention
 
-        source_emb = self.source_transformer(source_emb, mask = source_mask)
+        if self.freeze_encoder:
+            with torch.no_grad():
+                source_emb = self.source_transformer(source_emb, mask = source_mask)
+        else:
+            source_emb = self.source_transformer(source_emb, mask = source_mask)
 
         # target attention
 
@@ -599,6 +615,8 @@ class TextToSemantic(Module):
 
         assert not empty(target)
 
+        predicted_target = torch.softmax(logits[:, :-1].detach(), dim = -1).argmax(dim = -1)
+        
         logits = rearrange(logits[:, :-1], 'b n c -> b c n')
 
         loss = F.cross_entropy(
@@ -606,8 +624,11 @@ class TextToSemantic(Module):
             target,
             ignore_index = target_pad_id
         )
+        
+        target_mask = target != target_pad_id
+        accuracy = (predicted_target[target_mask] == target[target_mask]).sum() / target_mask.sum()
 
-        return loss
+        return loss, accuracy
 
 # pretraining modules
 
@@ -639,7 +660,6 @@ class SpeechSpeechPretrainWrapper(nn.Module):
 
         self.model = model
         self.wav2vec = default(wav2vec, model.wav2vec)
-        assert exists(self.wav2vec)
 
         self.deletion_prob = deletion_prob
         self.reconstruct_seq = reconstruct_seq # whether to reconstruct the entire sequence, or just output the deleted ones in order
@@ -651,6 +671,8 @@ class SpeechSpeechPretrainWrapper(nn.Module):
         is_raw_audio = x.dtype == torch.float
 
         if is_raw_audio:
+            assert exists(self.wav2vec)
+            
             with torch.no_grad():
                 self.wav2vec.eval()
                 x = self.wav2vec(x, flatten = False)
@@ -668,11 +690,41 @@ class SpeechSpeechPretrainWrapper(nn.Module):
         else:
             target = rearrange(x[delete_mask], '(b n) -> b n', b = batch)
 
-        loss = self.model(
+        loss, accuracy = self.model(
             source, target,
             source_type = 'speech',
             target_type = 'speech',
             return_loss = True
         )
 
-        return loss
+        return loss, accuracy
+
+# wrapper for backtranslation task
+
+class SemanticToTextWrapper(nn.Module):
+    @beartype
+    def __init__(
+        self,
+        model: TextToSemantic
+    ):
+        super().__init__()
+
+        self.model = model
+
+    def forward(
+        self,
+        semantic_token_ids,
+        phoneme_token_ids,
+    ):
+        source = semantic_token_ids
+        target = phoneme_token_ids
+
+        loss, accuracy = self.model(
+            source, target,
+            source_type = 'speech',
+            target_type = 'text',
+            return_loss = True
+        )
+
+        return loss, accuracy
+
