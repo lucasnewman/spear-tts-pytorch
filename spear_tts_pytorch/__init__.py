@@ -3,5 +3,5 @@ from spear_tts_pytorch.spear_tts_pytorch import (
     SpeechSpeechPretrainWrapper,
     SemanticToTextWrapper,
 )
-from spear_tts_pytorch.data import SemanticDataset, SemanticPhonemeDataset
+from spear_tts_pytorch.data import SemanticDataset, SemanticGraphemeDataset
 from spear_tts_pytorch.trainer import SpeechSpeechPretrainer

@@ -86,13 +86,14 @@ class SemanticDataset(Dataset):
         return data
     
 
-class SemanticPhonemeDataset(Dataset):
+class SemanticGraphemeDataset(Dataset):
     @beartype
     def __init__(
         self,
         folder,
         exts = ['flac', 'wav', 'mp3', 'webm'],
-        max_length: OptionalIntOrTupleInt = None,
+        data_max_length_seconds: OptionalIntOrTupleInt = None,
+        max_grapheme_length: OptionalIntOrTupleInt = None,
         target_sample_hz: OptionalIntOrTupleInt = None,
         seq_len_multiple_of: OptionalIntOrTupleInt = None
     ):
@@ -104,7 +105,8 @@ class SemanticPhonemeDataset(Dataset):
         assert len(files) > 0, 'no sound files found'
 
         self.files = files
-        self.max_downsampled_length = int(max_length / seq_len_multiple_of)
+        self.max_semantic_length = int((data_max_length_seconds * target_sample_hz) / seq_len_multiple_of)
+        self.max_grapheme_length = max_grapheme_length
 
     def __len__(self):
         return len(self.files)
@@ -115,46 +117,33 @@ class SemanticPhonemeDataset(Dataset):
         semantic_file = file.with_suffix('.semantic.pt')
         semantic_token_ids = torch.load(semantic_file)
         
-        phonemes_file = file.with_suffix('.phonemes.pt')
-        phoneme_token_ids = torch.load(phonemes_file).unsqueeze(0)
-        
-        print(f"semantic_token_ids: {semantic_token_ids.size()}, phoneme_token_ids: {phoneme_token_ids.size()}")
-        assert semantic_token_ids.size(1) == phoneme_token_ids.size(1), f'semantic and phoneme token ids must have the same length: {semantic_token_ids.size(1)}, {phoneme_token_ids.size(1)}'
-        
-        # take a random crop of max_downsampled_length
-        max_semantic_length = min(self.max_downsampled_length, semantic_token_ids.size(1))
-        max_phoneme_length = min(self.max_downsampled_length, phoneme_token_ids.size(1))
-        
-        if semantic_token_ids.size(1) > max_semantic_length:
-            start = torch.randint(0, semantic_token_ids.size(1), (1, ))
-            semantic_token_ids = semantic_token_ids[:, start:(start + max_semantic_length)]
-            phoneme_token_ids = phoneme_token_ids[:, start:(start + max_phoneme_length)]
+        graphemes_file = file.with_suffix('.graphemes.pt')
+        grapheme_token_ids = torch.load(graphemes_file).unsqueeze(0)
         
         # unique the token ids
         
         semantic_token_ids = batch_unique_consecutive(semantic_token_ids)
-        phoneme_token_ids = batch_unique_consecutive(phoneme_token_ids)
-        
         semantic_token_length = semantic_token_ids.size(1)
+        grapheme_token_length = grapheme_token_ids.size(1)
 
         # pad or curtail
         
-        max_length = self.max_downsampled_length
-        
-        if exists(max_length):
-            if semantic_token_length > max_length:
-                max_start = semantic_token_length - max_length
-                start = torch.randint(0, max_start, (1, ))
-                semantic_token_ids = semantic_token_ids[:, start:start + max_length]
-                phoneme_token_ids = phoneme_token_ids[:, start:start + max_length]
+        if exists(self.max_semantic_length):
+            if semantic_token_length > self.max_semantic_length:
+                semantic_token_ids = semantic_token_ids[:, :self.max_semantic_length]
             else:
-                semantic_token_ids = F.pad(semantic_token_ids, (0, max_length - semantic_token_length), 'constant')
-                phoneme_token_ids = F.pad(phoneme_token_ids, (0, max_length - semantic_token_length), 'constant')
+                semantic_token_ids = F.pad(semantic_token_ids, (0, self.max_semantic_length - semantic_token_length), 'constant')
+
+        if exists(self.max_grapheme_length):
+            if grapheme_token_length > self.max_grapheme_length:
+                grapheme_token_ids = grapheme_token_ids[:, : self.max_grapheme_length]
+            else:
+                grapheme_token_ids = F.pad(grapheme_token_ids, (0, self.max_grapheme_length - grapheme_token_length), 'constant')
 
         semantic_token_ids = rearrange(semantic_token_ids, '1 ... -> ...')
-        phoneme_token_ids = rearrange(phoneme_token_ids, '1 ... -> ...')
+        grapheme_token_ids = rearrange(grapheme_token_ids, '1 ... -> ...')
         
-        return semantic_token_ids, phoneme_token_ids
+        return semantic_token_ids, grapheme_token_ids
 
 # dataloader functions
 

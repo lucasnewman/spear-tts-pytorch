@@ -29,6 +29,10 @@ def default(val, d):
 def empty(t: Tensor):
     return t.numel() == 0
 
+@contextmanager
+def null_context():
+    yield
+    
 def set_eos_id(t: Tensor, eos_id: int, pad_id: int):
     eos_indices = ((t == pad_id).cumsum(dim = -1) == 0).sum(dim = -1, keepdim = True).long()
 
@@ -255,7 +259,7 @@ class Transformer(nn.Module):
         attn_dropout = 0.,
         ff_mult = 4,
         ff_dropout = 0.,
-        cross_attend = False
+        cross_attend = False,
     ):
         super().__init__()
 
@@ -298,6 +302,22 @@ class Transformer(nn.Module):
             x = ff(x) + x
 
         return self.final_norm(x)
+
+def model_forward_with_context(
+    *,
+    fn,
+    args,
+    freeze,
+):
+    encoding_context = null_context if not freeze else torch.no_grad
+
+    with encoding_context():
+        enc = fn(*args)
+
+        if freeze:
+            enc.detach_()
+
+    return enc
 
 # class
 
@@ -434,10 +454,9 @@ class TextToSemantic(Module):
     def load(self, path):
         # Return pkg so that if this function gets called from within a Trainer function call,
         # the trainer can also access the package loaded from the checkpoint.
-        device = self.device
         path = Path(path)
         assert path.exists()
-        pkg = torch.load(str(path), map_location = device)
+        pkg = torch.load(str(path), map_location = self.device)
         self.load_state_dict(pkg['model'])
         return pkg
 
@@ -458,7 +477,9 @@ class TextToSemantic(Module):
         filter_logits_fn = top_k,
         filter_thres = 0.9,
         source_mask: Optional[Tensor] = None,
-        max_length = 2048
+        max_length = 2048,
+        beam_search_decode = False,
+        beam_size = 4,
     ):
         if is_bearable(source, List[str]):
             assert exists(self.tokenizer_encode)
@@ -489,7 +510,7 @@ class TextToSemantic(Module):
 
         if not exists(source_mask) and source.dtype == torch.long:
             source_mask = source != source_pad_id
-
+        
         # source embedding
 
         source_emb = source_token_emb(source)
@@ -503,35 +524,73 @@ class TextToSemantic(Module):
 
         # loop to decode
 
-        for _ in tqdm(range(max_length)):
-            target_emb = target_token_emb(target)
-            target_emb = torch.cat((start_token, target_emb), dim = 1)
+        if not beam_search_decode:
+            for _ in tqdm(range(max_length)):
+                target_emb = target_token_emb(target)
+                target_emb = torch.cat((start_token, target_emb), dim = 1)
 
-            # target attention
+                # target attention
 
-            target_emb = self.target_transformer(target_emb, context = source_emb, context_mask = source_mask)
+                target_emb = self.target_transformer(target_emb, context = source_emb, context_mask = source_mask)
 
-            # decoder logits
+                # decoder logits
 
-            logits = target_to_logit(target_emb)
+                logits = target_to_logit(target_emb)
 
-            logits = logits[:, -1]
-            logits = filter_logits_fn(logits, thres = filter_thres)
+                logits = logits[:, -1]
+                
+                logits = filter_logits_fn(logits, thres = filter_thres)
 
-            sampled = gumbel_sample(logits, temperature = temperature)
-            target, _ = pack((target, sampled), 'b *')
+                sampled = gumbel_sample(logits, temperature = temperature)
+                target, _ = pack((target, sampled), 'b *')
 
-            if not self.autoset_eos_id[target_type]:
-                continue
+                if not self.autoset_eos_id[target_type]:
+                    continue
 
-            is_eos = target == target_eos_id
+                is_eos = target == target_eos_id
 
-            if not is_eos.any(dim = -1).all():
-                continue
+                if not is_eos.any(dim = -1).all():
+                    continue
 
-            mask = is_eos.cumsum(dim = -1) == 0
-            target = target.masked_fill(~mask, target_pad_id)
-            break
+                mask = is_eos.cumsum(dim = -1) == 0
+                target = target.masked_fill(~mask, target_pad_id)
+                break
+        else:
+            beam = [(target, 0.0)]
+            
+            for _ in tqdm(range(max_length)):
+                all_candidates = []
+                
+                for sentence, sentence_prob in beam:
+                    target_emb = target_token_emb(sentence)
+                    target_emb = torch.cat((start_token, target_emb), dim = 1)
+
+                    # target attention
+                    
+                    target_emb = self.target_transformer(target_emb, context = source_emb, context_mask = source_mask)
+
+                    # decoder logits
+
+                    logits = target_to_logit(target_emb)
+                    logits = logits[:, -1]
+
+                    log_probs = torch.log_softmax(logits / max(temperature, 1e-10), dim = -1)
+                    topk_log_probs, topk_ids = log_probs.topk(beam_size, dim = -1)
+                    
+                    for i in range(beam_size):
+                        candidate = torch.cat([sentence, topk_ids[..., i:i + 1]], dim = -1)
+                        candidate_prob = sentence_prob + topk_log_probs[..., i]
+                        all_candidates.append((candidate, candidate_prob))
+
+                ordered = sorted(all_candidates, key = lambda tup: tup[1], reverse = True)
+                beam = ordered[:beam_size]
+                
+                # check if we've hit eos for all sequences
+                all_eos = all([((sentence == target_eos_id).any(dim = -1)).all() for sentence, _ in beam])
+                if all_eos:
+                    break
+                
+            target = beam[0][0]
 
         return target
 
@@ -544,6 +603,7 @@ class TextToSemantic(Module):
         source_type: SpeechOrTextLiteral,
         target_type: SpeechOrTextLiteral,
         source_mask: Optional[Tensor] = None,
+        target_mask: Optional[Tensor] = None,
         return_loss = False
     ):
         if is_bearable(source, List[str]):
@@ -579,11 +639,17 @@ class TextToSemantic(Module):
             target_eos_id = self.eos_id[target_type]
             target = set_eos_id(target, target_eos_id, pad_id = target_pad_id)
 
-        # if source mask is not passed in
+        # if source/target mask is not passed in
         # automatically derive by the padding id of the modality
 
         if not exists(source_mask) and source.dtype == torch.long:
             source_mask = source != source_pad_id
+
+        if not exists(target_mask) and target.dtype == torch.long:
+            target_mask = target != target_pad_id
+
+            # attend to bos
+            target_mask = F.pad(target_mask, (1, 0), value = True)
 
         # embedding
 
@@ -596,15 +662,15 @@ class TextToSemantic(Module):
 
         # source attention
 
-        if self.freeze_encoder:
-            with torch.no_grad():
-                source_emb = self.source_transformer(source_emb, mask = source_mask)
-        else:
-            source_emb = self.source_transformer(source_emb, mask = source_mask)
+        model_forward_with_context(
+            fn = self.source_transformer,
+            args = (source_emb, source_mask),
+            freeze = self.freeze_encoder
+        )
 
         # target attention
 
-        target_emb = self.target_transformer(target_emb, context = source_emb, context_mask = source_mask)
+        target_emb = self.target_transformer(target_emb, mask = target_mask, context = source_emb, context_mask = source_mask)
 
         # decoder logits
 
@@ -714,10 +780,10 @@ class SemanticToTextWrapper(nn.Module):
     def forward(
         self,
         semantic_token_ids,
-        phoneme_token_ids,
+        grapheme_token_ids,
     ):
         source = semantic_token_ids
-        target = phoneme_token_ids
+        target = grapheme_token_ids
 
         loss, accuracy = self.model(
             source, target,
