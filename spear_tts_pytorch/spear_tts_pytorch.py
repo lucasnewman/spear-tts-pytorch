@@ -5,8 +5,8 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from torch import Tensor, nn, einsum, FloatTensor
-from torch.nn import Module
+from torch import Tensor, nn, einsum, FloatTensor, IntTensor, LongTensor
+from torch.nn import Module, ModuleList
 
 from torch.utils.data import Dataset
 
@@ -17,7 +17,7 @@ from audiolm_pytorch.data import get_dataloader
 
 from beartype import beartype
 from beartype.door import is_bearable
-from beartype.typing import Optional, Union, Callable, Literal, List
+from beartype.typing import Optional, Union, Callable, Literal, Tuple, List
 
 from x_clip.tokenizer import tokenizer
 
@@ -820,13 +820,14 @@ class SpeechSpeechPretrainWrapper(nn.Module):
             source = x.masked_fill(delete_mask, self.mask_id)
         else:
             delete_mask = get_mask_subset_prob(mask, self.deletion_prob)
+
             source = rearrange(x[~delete_mask], '(b n) -> b n', b = batch)
-        
+
         if self.reconstruct_seq:
             target = x
         else:
             target = rearrange(x[delete_mask], '(b n) -> b n', b = batch)
-        
+
         loss, logits = self.model(
             source, target,
             source_type = 'speech',
